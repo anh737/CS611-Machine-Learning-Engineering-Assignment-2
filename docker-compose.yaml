@@ -1,0 +1,133 @@
+# =============================================================================
+# CS611 Assignment 2 - Airflow stack (LocalExecutor + Postgres)
+#
+# Usage (as per the grading rubric):
+#   docker-compose build
+#   docker-compose up
+# Then open the Airflow UI at:  http://localhost:8080   (login: airflow / airflow)
+#
+# A simplified, self-contained version of the official Airflow compose file:
+#   - postgres        : metadata database
+#   - airflow-init    : one-off DB migration + admin user creation
+#   - airflow-webserver / airflow-scheduler : the running Airflow services
+# =============================================================================
+x-airflow-common: &airflow-common
+  build: .
+  image: cs611_assignment2_airflow:latest
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+    # Give PySpark room and silence noisy logs.
+    JAVA_HOME: /usr/lib/jvm/current-java
+    PYTHONUNBUFFERED: '1'
+    # Serve the scheduler health endpoint (port 8974) so its healthcheck passes.
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # A fixed secret key shared by webserver + scheduler (avoids session issues).
+    AIRFLOW__WEBSERVER__SECRET_KEY: 'cs611-assignment2-shared-secret'
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    # Mount the ENTIRE project at /opt/airflow/project so every script
+    # (test.py, train.py, inference.py, monitoring.py, utils/, ...) is available
+    # to the DAG, and datamart/ + model_bank/ + tensorboard_logs/ persist back
+    # to the host. Mounting the whole folder avoids having to add a new bind
+    # mount every time a script is added.
+    - .:/opt/airflow/project
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  # One-off initialisation. Runs as ROOT so it can create and chown the bind-
+  # mounted output folders to the Airflow user -> the pipeline can write its
+  # datamart / model_bank / tensorboard_logs / logs on ANY host (Linux included)
+  # without the user editing AIRFLOW_UID. Then it migrates the DB + creates admin.
+  airflow-init:
+    <<: *airflow-common
+    user: "0:0"
+    entrypoint: /bin/bash
+    environment:
+      <<: *airflow-common-env
+      # Let the official image entrypoint migrate the DB and create the admin user
+      # (robust + waits for Postgres). Login will be airflow / airflow.
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: airflow
+      _AIRFLOW_WWW_USER_PASSWORD: airflow
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/logs /opt/airflow/plugins \
+                 /opt/airflow/project/datamart /opt/airflow/project/model_bank \
+                 /opt/airflow/project/tensorboard_logs
+        chown -R "${AIRFLOW_UID:-50000}:0" \
+                 /opt/airflow/logs /opt/airflow/plugins \
+                 /opt/airflow/project/datamart /opt/airflow/project/model_bank \
+                 /opt/airflow/project/tensorboard_logs || true
+        exec /entrypoint airflow version
+    restart: on-failure
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # TensorBoard UI for real-time training curves (written by train.py).
+  # Open http://localhost:6006 after the training task has run.
+  tensorboard:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - tensorboard --logdir /opt/airflow/project/tensorboard_logs --host 0.0.0.0 --port 6006
+    ports:
+      - "6006:6006"
+    restart: always
+
+volumes:
+  postgres-db-volume:

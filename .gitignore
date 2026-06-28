@@ -1,0 +1,73 @@
+# =============================================================================
+# CS611 Assignment 2 — .gitignore
+# =============================================================================
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Virtual environments ----------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# --- Jupyter -----------------------------------------------------------------
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# --- Environment / secrets ---------------------------------------------------
+# .env only contains AIRFLOW_UID here, but keep secrets out of version control.
+.env
+.env.*
+!.env.example
+
+# --- Airflow runtime ---------------------------------------------------------
+logs/
+airflow.cfg
+airflow.db
+unittests.cfg
+webserver_config.py
+standalone_admin_password.txt
+airflow-worker.pid
+
+# --- Generated ML artefacts (rebuilt by the pipeline) ------------------------
+# The DAG regenerates these, so they are not tracked. Remove a line below if
+# you DO want to commit that output (e.g. to hand a grader a prebuilt datamart).
+datamart/
+model_bank/
+tensorboard_logs/
+
+# --- Raw source data is KEPT (input to the pipeline): data/ ------------------
+# (intentionally NOT ignored)
+
+# --- OS / editor cruft -------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*~
+*.swp
+*.swo
+
+# --- MS Office temp/lock files ----------------------------------------------
+~$*.docx
+~$*.xlsx
+~$*.pptx
+
+# --- IDE ---------------------------------------------------------------------
+.idea/
+.vscode/
+*.iml
