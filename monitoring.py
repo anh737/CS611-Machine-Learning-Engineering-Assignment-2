@@ -1,28 +1,18 @@
-"""
-=============================================================================
-monitoring.py  -  Model Performance & Stability Monitoring (Gold table + viz)
-=============================================================================
-Purpose
-    Read the Gold predictions table produced by inference.py and monitor the
-    model across time on two axes:
-        1. PERFORMANCE  -> AUC and Gini per application month (where the actual
-                           label is available).
-        2. STABILITY    -> Population Stability Index (PSI) of the predicted
-                           score distribution per month vs a baseline month.
-    Results are written back as a Gold monitoring table, and a summary chart
-    (PNG) is produced for the presentation deck.
+"""Track the deployed model on two axes: is it still accurate, and is the input
+population still the one it was trained on.
 
-Design notes
-    * Pure pandas + matplotlib (NO Spark).
-    * PSI interpretation (industry rule of thumb):
-        PSI < 0.10           -> stable (no significant shift)
-        0.10 <= PSI < 0.25   -> moderate shift (investigate)
-        PSI >= 0.25          -> major shift (model likely needs refresh)
+* Performance — AUC and Gini per application month, wherever the actual label
+  has matured.
+* Stability — Population Stability Index of the predicted score distribution
+  against a baseline month. The usual reading: below 0.10 is stable, 0.10 to
+  0.25 warrants investigation, above 0.25 says the model needs a refresh.
 
-Usage
+Writes a gold monitoring table plus a summary chart.
+
+Usage:
     python monitoring.py
-=============================================================================
 """
+
 import os
 import glob
 
@@ -74,18 +64,13 @@ def load_predictions(pred_dir):
     """Read every monthly Gold prediction partition into one DataFrame."""
     parts = glob.glob(os.path.join(pred_dir, "*.parquet"))
     if not parts:
-        raise FileNotFoundError(f"[CRITICAL] No prediction parquet found in {pred_dir}. "
-                                f"Run inference.py first.")
+        raise FileNotFoundError(f"No prediction partitions in {pred_dir}. Run inference.py first.")
     df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
     df["snapshot_date"] = pd.to_datetime(df["snapshot_date"])
     return df.sort_values("snapshot_date")
 
 
 def main():
-    print("\n=====================================================================")
-    print("          MODEL MONITORING  -  PERFORMANCE & STABILITY              ")
-    print("=====================================================================\n")
-
     pred_dir = "datamart/gold/model_predictions/"
     monitor_dir = "datamart/gold/model_monitoring/"
     os.makedirs(monitor_dir, exist_ok=True)
@@ -93,7 +78,7 @@ def main():
     # 1. Load all scored predictions
     df = load_predictions(pred_dir)
     df["month"] = df["snapshot_date"].dt.to_period("M").dt.to_timestamp()
-    print(f"[INFO] Loaded {len(df)} predictions across {df['month'].nunique()} months.")
+    print(f"Loaded {len(df)} predictions across {df['month'].nunique()} months")
 
     # 2. Choose a STABILITY BASELINE = the earliest month with enough volume.
     #    (Ideally this would be the training-period score distribution; the
@@ -103,7 +88,7 @@ def main():
     if pd.isna(baseline_month):
         baseline_month = month_counts.index.min()
     baseline_scores = df.loc[df["month"] == baseline_month, "model_predict_proba"].values
-    print(f"[INFO] PSI baseline month: {baseline_month.date()} (n={len(baseline_scores)})")
+    print(f"PSI baseline month: {baseline_month.date()} (n={len(baseline_scores)})")
 
     # 3. Compute per-month performance + stability metrics
     records = []
@@ -125,14 +110,14 @@ def main():
     out_table = os.path.join(monitor_dir, "gold_model_monitoring.parquet")
     monitor_df.to_parquet(out_table, index=False)
     monitor_df.to_csv(os.path.join(monitor_dir, "gold_model_monitoring.csv"), index=False)
-    print(f"[SUCCESS] Monitoring table written to {out_table}")
+    print(f"Monitoring table: {out_table}")
     print("\n--- Monitoring summary ---")
     print(monitor_df.to_string(index=False))
 
     # 5. Visualise performance & stability across time
     plot_path = os.path.join(monitor_dir, "model_monitoring_plot.png")
     _plot_monitoring(monitor_df, baseline_month, plot_path)
-    print(f"\n[SUCCESS] Monitoring chart saved to {plot_path}")
+    print(f"\nMonitoring chart: {plot_path}")
 
     # 6. Simple governance signal based on latest PSI / Gini
     latest = monitor_df.dropna(subset=["psi_vs_baseline"]).iloc[-1]
@@ -143,12 +128,7 @@ def main():
         verdict = "MODERATE DRIFT -> monitor closely"
     else:
         verdict = "STABLE -> no action needed"
-    print(f"\n[GOVERNANCE] Latest month {latest['month'].date()} "
-          f"PSI={psi_val} -> {verdict}")
-
-    print("\n=====================================================================")
-    print("                 MONITORING STAGE COMPLETED CLEANLY                 ")
-    print("=====================================================================\n")
+    print(f"\nLatest month {latest['month'].date()}: PSI={psi_val} -> {verdict}")
 
 
 def _plot_monitoring(monitor_df, baseline_month, plot_path):
