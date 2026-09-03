@@ -1,96 +1,59 @@
+"""Gold layer: build the label store and the feature set that feeds the model.
+
+Two things happen here, and the split between them is the whole point:
+
+* The **label** is forward-looking — did this loan ever reach ``dpd`` days past
+  due within its first ``mob`` months on book. Looking forward is legitimate
+  here, because that is the target being predicted.
+* The **features** are anchored at the application date (month on book 0), the
+  only point in time a real scoring system would have them. Anchoring this way
+  is what keeps future information out of the training set.
+
+An earlier version keyed each gold row on the *latest* snapshot in the
+performance window. That had two defects: financials and attributes only exist
+at month 0, so joining on a later date returned nulls; and clickstream events
+from month 6 leaked information the model would not have at scoring time.
+"""
+
 import os
-import glob
-import pandas as pd
-import matplotlib.pyplot as plt
-import numpy as np
-import random
-from datetime import datetime, timedelta
-from dateutil.relativedelta import relativedelta
-import pprint
-import pyspark
+
 import pyspark.sql.functions as F
-import argparse
+from pyspark.sql.functions import col
+from pyspark.sql.types import StringType, IntegerType, FloatType, DateType
 
-from pyspark.sql.window import Window
-from pyspark.sql.functions import col, when, lit, regexp_replace, desc, split, abs, size, sum, avg, round, countDistinct, count
-from pyspark.sql.types import StringType, IntegerType, FloatType, DateType, ArrayType
-
-
-# def process_labels_gold_table(snapshot_date_str, silver_loan_daily_directory, gold_label_store_directory, spark, dpd, mob):
-    
-#     # prepare arguments
-#     snapshot_date = datetime.strptime(snapshot_date_str, "%Y-%m-%d")
-    
-#     # connect to silver table
-#     partition_name = "silver_loan_daily_" + snapshot_date_str.replace('-','_') + '.parquet'
-#     filepath = silver_loan_daily_directory + partition_name
-#     df = spark.read.parquet(filepath)
-#     print('loaded from:', filepath, 'row count:', df.count())
-
-#     # get customer at mob
-#     df = df.filter(col("mob") == mob)
-
-#     # get label
-#     df = df.withColumn("label", F.when(col("dpd") >= dpd, 1).otherwise(0).cast(IntegerType()))
-#     df = df.withColumn("label_def", F.lit(str(dpd)+'dpd_'+str(mob)+'mob').cast(StringType()))
-
-#     # select columns to save
-#     df = df.select("loan_id", "Customer_ID", "label", "label_def", "snapshot_date")
-
-#     # save gold table - IRL connect to database to write
-#     partition_name = "gold_label_store_" + snapshot_date_str.replace('-','_') + '.parquet'
-#     filepath = gold_label_store_directory + partition_name
-#     df.write.mode("overwrite").parquet(filepath)
-#     # df.toPandas().to_parquet(filepath,
-#     #           compression='gzip')
-#     print('saved to:', filepath)
-    
-#     return df
 
 def load_silver_data(start_date_str: str = "2023-01-01", end_date_str: str = "2025-11-01", spark = None):
-    """
-    Scans, reads, and filters all 4 Silver layer tables within a specified date range.
-    Uses wildcard patterns to load multiple files in parallel without any loops.
-    
-    Parameters:
-    -----------
-    start_date_str : str
-        The lower bound of the snapshot date range (format: 'YYYY-MM-DD').
-    end_date_str : str
-        The upper bound of the snapshot date range (format: 'YYYY-MM-DD').
-        
+    """Read all four silver tables and clip them to a snapshot date range.
+
+    Args:
+        start_date_str: Inclusive lower bound, ``YYYY-MM-DD``.
+        end_date_str: Inclusive upper bound, ``YYYY-MM-DD``.
+        spark: Active Spark session.
+
     Returns:
-    --------
-    tuple of PySpark DataFrames
-        (df_lms, df_click, df_attr, df_fin) ready for further data pipeline stages.
+        ``(df_lms, df_click, df_attr, df_fin)``.
     """
-    # 1. Define the root directory for Silver layer data
     silver_root_dir = "datamart/silver"
 
-    # 2. Formulate paths using wildcard (*) to scan all underlying Parquet files efficiently
+    # Glob each table so one read picks up every monthly partition.
     lms_pattern = os.path.join(silver_root_dir, "loan_daily", "*.parquet")
     click_pattern = os.path.join(silver_root_dir, "clickstream", "*.parquet")
     attr_pattern = os.path.join(silver_root_dir, "attributes", "*.parquet")
     fin_pattern = os.path.join(silver_root_dir, "financials", "*.parquet")
 
-    # 3. Read the complete directory contents into parallelized DataFrames
-    print(f"[INFO] Scanning Silver layer paths dynamically...")
     df_lms_raw = spark.read.parquet(lms_pattern)
     df_click_raw = spark.read.parquet(click_pattern)
     df_attr_raw = spark.read.parquet(attr_pattern)
     df_fin_raw = spark.read.parquet(fin_pattern)
 
-    # 4. Filter the time-series dynamic dataframes based on the requested date window
-    print(f"[INFO] Applying chronological filter: {start_date_str} to {end_date_str}")
+    print(f"  silver window: {start_date_str} to {end_date_str}")
     df_lms = df_lms_raw.filter((F.col("snapshot_date") >= start_date_str) & (F.col("snapshot_date") <= end_date_str))
     df_click = df_click_raw.filter((F.col("snapshot_date") >= start_date_str) & (F.col("snapshot_date") <= end_date_str))
     df_attr = df_attr_raw.filter((F.col("snapshot_date") >= start_date_str) & (F.col("snapshot_date") <= end_date_str))
     df_fin = df_fin_raw.filter((F.col("snapshot_date") >= start_date_str) & (F.col("snapshot_date") <= end_date_str))
 
 
-    print(f"[SUCCESS] All 4 DataFrames loaded and filtered successfully.")
     return df_lms, df_click, df_attr, df_fin
-
 
 
 def process_labels_gold_table(
@@ -100,42 +63,21 @@ def process_labels_gold_table(
     mob,
     dpd = 30
 ):
-    """
-    Process Silver layer tables to create Gold layer features and labels.
-    Merges financial, clickstream, attributes, and loan daily data.
-    """
-    
-    # # 1. Prepare arguments and file paths
-    # snapshot_date = datetime.strptime(snapshot_date_str, "%Y-%m-%d")
-    # suffix = snapshot_date_str.replace('-', '_')
-    
-    # fin_output_path = os.path.join(fin_silver_dir, "silver_financials_" + suffix + '.parquet')
-    # click_output_path = os.path.join(click_silver_dir, "silver_clickstream_" + suffix + '.parquet')
-    # attr_output_path = os.path.join(attr_silver_dir, "silver_attributes_" + suffix + '.parquet')
-    # lms_output_path = os.path.join(silver_loan_daily_directory, "silver_loan_daily_" + suffix + '.parquet')
+    """Build one gold partition: labels joined to the model feature set.
 
-    # # 2. Load Silver DataFrames
-    # print(f"[INFO] Loading silver tables for snapshot: {snapshot_date_str}")
-    # df_fin = spark.read.parquet(fin_output_path)
-    # df_click = spark.read.parquet(click_output_path)
-    # df_attr = spark.read.parquet(attr_output_path)
-    # df_lms = spark.read.parquet(lms_output_path)
+    Args:
+        snapshot_date_str: Snapshot to build, ``YYYY-MM-DD``.
+        gold_label_store_directory: Output path for the gold partitions.
+        spark: Active Spark session.
+        mob: Performance window in months on book.
+        dpd: Days past due that define a "bad" loan.
+    """
     df_lms, df_click, df_attr, df_fin = load_silver_data(end_date_str = snapshot_date_str,spark = spark)
     suffix = snapshot_date_str.replace('-', '_')
-    # =========================================================================
-    # 3: LABEL (forward mob1-mob) + ANCHOR FEATURES AT APPLICATION (mob 0)
-    # ====Quick fix====
-    # Cu: nhan lay snapshot MOI NHAT trong cua so mob1-6 lam khoa join feature.
-    #     Nhung financials/attributes chi ton tai o mob0 (ngay nop don) -> sai
-    #     ngay -> join ra NULL het; con clickstream bi lay o mob6 = leak tuong lai.
-    # Moi: nhan van nhin ve tuong lai (mob1-mob, day la TARGET nen hop le), nhung
-    #      DONG gold duoc NEO o ngay nop don (mob0) de feature khop dung thoi diem
-    #      du doan -> feature tai chinh/nhan khau het NULL, clickstream het leak.
-    # ====Quick fix====
-    # =========================================================================
-    print(f"[INFO] Generating leakage-safe labels: {dpd}DPD within {mob}MOB, anchored at application...")
+    # --- Labels look forward over months 1..mob; the row is anchored at month 0 ---
+    print(f"[gold] {snapshot_date_str} — labelling {dpd}DPD within {mob}MOB, anchored at application")
 
-    # 1. MOB + DPD cho moi dong lich su trong LMS
+    # Month on book and days past due, for every installment row.
     df_lms = df_lms.withColumn("mob_calculated", col("installment_num").cast(IntegerType()))
     df_lms = df_lms.withColumn(
         "installments_missed",
@@ -156,9 +98,8 @@ def process_labels_gold_table(
         ).otherwise(0).cast(IntegerType())
     )
 
-    # 2. ====Quick fix==== Nhan forward-looking tren cua so mob 1..mob.
-    #    Chi giu loan da quan sat DU cua so (max mob >= mob) -> nhan "chin",
-    #    on dinh, khong phu thuoc ngay xu ly. ====Quick fix====
+    # Only loans observed for the full window get a label. That keeps the label
+    # "mature" and stops it depending on when the pipeline happens to run.
     df_perf_window = df_lms.filter((col("mob_calculated") >= 1) & (col("mob_calculated") <= mob))
     df_label = df_perf_window.groupBy("Customer_ID", "loan_id").agg(
         F.max("dpd_calculated").alias("max_dpd_ever"),
@@ -168,21 +109,17 @@ def process_labels_gold_table(
         .withColumn("label", F.when(col("max_dpd_ever") >= dpd, 1).otherwise(0).cast(IntegerType())) \
         .withColumn("label_def", F.lit(str(dpd) + 'dpd_within_' + str(mob) + 'mob').cast(StringType()))
 
-    # 3. ====Quick fix==== Neo o NGAY NOP DON = snapshot tai mob 0 (loan_start).
-    #    snapshot_date cua dong gold = ngay nop don -> feature join dung thoi diem,
-    #    va dong gold giong het nhau giua cac partition -> de khu trung o train.
-    # ====Quick fix====
+    # Anchor the gold row on the application date (month on book 0), so features
+    # join at the moment a real system would have them. A side benefit: the row is
+    # identical across partitions, which makes de-duplication in train.py trivial.
     df_application = df_lms.filter(col("installment_num") == 0) \
         .select("Customer_ID", "loan_id", col("snapshot_date").alias("snapshot_date"))
 
     df_default_labels = df_label.join(df_application, on=["Customer_ID", "loan_id"], how="inner")
 
-    print(f"[SUCCESS] Matured labels anchored at application: {df_default_labels.count()}")
-    
-    # ---------------------------------------------------------
-    # 4. Feature Engineering (Gold Layer) on Financial table
-    # ---------------------------------------------------------
-    print("[INFO] Engineering Gold features...")
+    print(f"  labelled loans: {df_default_labels.count()}")
+
+    # --- Derived financial ratios ---
     df_fin_gold = df_fin \
         .withColumn(
             "Debt_to_Income_Ratio",
@@ -220,9 +157,7 @@ def process_labels_gold_table(
         )
 
 
-    # ---------------------------------------------------------
-    # 5. Feature Engineering (Gold Layer) on Attribute table
-    # ---------------------------------------------------------
+    # --- Derived demographic features ---
     df_attr_gold = df_attr \
         .withColumn(
             "Is_Age_gt_45",
@@ -249,9 +184,7 @@ def process_labels_gold_table(
          .otherwise(28.52).cast(FloatType())
     )
 
-    # ---------------------------------------------------------
-    # DYNAMIC TIME-LAPSE CALCULATION FOR CREDIT HISTORY AGE
-    # ---------------------------------------------------------
+    # --- Credit history age, parsed from its free-text form ---
     df_fin_gold = df_fin_gold \
         .withColumn(
             "Extracted_Years", 
@@ -266,9 +199,8 @@ def process_labels_gold_table(
             (F.col("Extracted_Years") * 12) + F.col("Extracted_Months")
         ) \
         .withColumn(
-            # ====Quick fix==== Tinh tuoi lich su tin dung AS OF ngay nop don (snapshot_date)
-            # thay vi theo snapshot_date_str (ngay xu ly) -> bo phu thuoc thoi diem chay
-            # pipeline, dong gold deterministic + khong leak du lieu tuong lai. ====Quick fix====
+            # Credit history age is taken as of the application date, not the date
+            # the pipeline runs, so the gold row is deterministic on re-runs.
             "Months_From_Input_To_Snapshot",
             F.lit(0)
         ) \
@@ -286,24 +218,16 @@ def process_labels_gold_table(
         ) \
         .drop("Extracted_Years", "Extracted_Months", "Base_History_Months", "Months_From_Input_To_Snapshot")
 
-    # =========================================================================
-    # 6. Merge all 4 tables (DUAL-KEY POLICY)
-    # =========================================================================
-    print("[INFO] Merging all DataFrames using a leakage-proof dual-key constraint...")
-    
-    # Define explicit compound join keys to eliminate cross-date leakage
+    # --- Join the four tables ---
+    # Join on customer AND snapshot date, so a customer's features can never be
+    # picked up from a different month than the one being labelled.
     join_keys = ["Customer_ID", "snapshot_date"]
-    
-    # Perform left joins matching both customer and the exact snapshot timeline
     df_merged = df_default_labels \
         .join(df_fin_gold, on=join_keys, how="left") \
         .join(df_click, on=join_keys, how="left") \
         .join(df_attr_gold, on=join_keys, how="left")
 
-    # ---------------------------------------------------------
-    # 7. Select desired columns
-    # ---------------------------------------------------------
-    # Selecting the final columns as per instruction
+    # --- Final column selection ---
     df_final = df_merged.select(
         "loan_id", 
         "Customer_ID",
@@ -354,17 +278,13 @@ def process_labels_gold_table(
         "fe_19",
         "fe_20"
     )
-    # ---------------------------------------------------------
-    # 8. Save Gold Table
-    # ---------------------------------------------------------
+    # --- Write the partition ---
     partition_name = "gold_label_store_" + suffix + '.parquet'
     filepath = os.path.join(gold_label_store_directory, partition_name)
-    
-    print(f"[INFO] Writing Gold table to {filepath}...")
-    df_final.write.mode("overwrite").parquet(filepath)
-    # df_final.toPandas().to_parquet(filepath, compression='gzip')
 
-    
-    print('[SUCCESS] Saved to:', filepath)
-    
+    df_final.write.mode("overwrite").parquet(filepath)
+
+
+    print(f"  wrote {filepath}")
+
     return df_final

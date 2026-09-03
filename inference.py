@@ -1,26 +1,15 @@
-"""
-=============================================================================
-inference.py  -  Model Inference / Scoring Stage (Gold predictions table)
-=============================================================================
-Purpose
-    Retrieve the best trained model from the model bank and score the Gold
-    feature store across a time period, then persist the model predictions as
-    a Gold table in the datamart.
+"""Score the gold feature store with the latest model from the model bank.
 
-Design notes
-    * Pure pandas + pyarrow (NO Spark). Scoring uses the pickled scikit-learn /
-      XGBoost model, so we avoid a Spark session entirely. This also sidesteps
-      the Windows winutils/HADOOP_HOME requirement when run natively.
-    * All preprocessing objects (median imputer, train-only target-encoding
-      maps, standard scaler) are loaded from the model artefact, so inference
-      reproduces EXACTLY the same transformations used at training time.
+Runs in pure pandas — the pickled artefact carries its own imputer, target-encoding
+maps and scaler, so inference reproduces the training-time transformations exactly
+without needing a Spark session.
 
-Usage
-    python inference.py                         # score every application month
-    python inference.py --snapshotdate 2024-09-01   # score a single month
-    python inference.py --modelname credit_model_2024_12_01.pkl   # pick a model
-=============================================================================
+Usage:
+    python inference.py                                            # score every month
+    python inference.py --snapshotdate 2024-09-01                  # one month
+    python inference.py --modelname credit_model_2024_12_01.pkl    # pick a model
 """
+
 import os
 import glob
 import argparse
@@ -75,10 +64,10 @@ def load_model_artefact(model_bank_dir, model_name=None):
     else:
         candidates = glob.glob(os.path.join(model_bank_dir, "*.pkl"))
         if not candidates:
-            raise FileNotFoundError(f"[CRITICAL] No model artefacts found in {model_bank_dir}")
+            raise FileNotFoundError(f"No model artefacts in {model_bank_dir}. Run train.py first.")
         model_path = max(candidates, key=os.path.getmtime)
 
-    print(f"[INFO] Loading model artefact: {model_path}")
+    print(f"Model artefact: {model_path}")
     with open(model_path, "rb") as f:
         artefact = pickle.load(f)
     return artefact, os.path.basename(model_path)
@@ -94,7 +83,7 @@ def load_gold_features(gold_label_dir):
     """
     parts = glob.glob(os.path.join(gold_label_dir, "*.parquet"))
     if not parts:
-        raise FileNotFoundError(f"[CRITICAL] No gold label parquet found in {gold_label_dir}")
+        raise FileNotFoundError(f"No gold partitions in {gold_label_dir}. Run the data pipeline first.")
     df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
     df = df.drop_duplicates("loan_id")
     df["snapshot_date"] = pd.to_datetime(df["snapshot_date"]).dt.date
@@ -102,11 +91,7 @@ def load_gold_features(gold_label_dir):
 
 
 def main(snapshot_date_arg=None, model_name=None):
-    print("\n=====================================================================")
-    print("            MODEL INFERENCE PIPELINE  -  GOLD PREDICTIONS            ")
-    print("=====================================================================\n")
 
-    # ---- Paths -------------------------------------------------------------
     model_bank_dir = "model_bank/"
     gold_label_dir = "datamart/gold/label_store/"
     pred_out_dir = "datamart/gold/model_predictions/"
@@ -123,7 +108,7 @@ def main(snapshot_date_arg=None, model_name=None):
     numeric_cols = pp["numeric_cols"]
     categorical_cols = pp["categorical_cols"]
     scaler = pp["stdscaler"]
-    print(f"[INFO] Using model_version={model_version} | features={len(feature_names)}")
+    print(f"Version {model_version}, {len(feature_names)} features")
 
     # 2. Load the Gold feature store (one row per loan)
     df = load_gold_features(gold_label_dir)
@@ -132,13 +117,13 @@ def main(snapshot_date_arg=None, model_name=None):
     if snapshot_date_arg:
         target = pd.to_datetime(snapshot_date_arg).date()
         df = df[df["snapshot_date"] == target].copy()
-        print(f"[INFO] Single-date inference for application month: {target}")
+        print(f"Scoring application month {target}")
     else:
-        print("[INFO] Full-period inference across all application months.")
-    print(f"[INFO] Rows to score: {len(df)}")
+        print("Scoring all application months")
+    print(f"Rows to score: {len(df)}")
 
     if df.empty:
-        print("[WARNING] No rows to score. Exiting.")
+        print("No rows to score.")
         return
 
     # 4. Rebuild features EXACTLY as in training
@@ -172,13 +157,8 @@ def main(snapshot_date_arg=None, model_name=None):
         out_path = os.path.join(pred_out_dir, f"gold_predictions_{suffix}.parquet")
         group.to_parquet(out_path, index=False)
         n_written += 1
-    print(f"[SUCCESS] Wrote {n_written} monthly prediction partition(s) to {pred_out_dir}")
-    print(f"[INFO] Overall predicted bad-rate: {round(pred_label.mean(), 3)} "
-          f"(actual: {round(df['label'].mean(), 3)})")
-
-    print("\n=====================================================================")
-    print("                 INFERENCE STAGE COMPLETED CLEANLY                  ")
-    print("=====================================================================\n")
+    print(f"Wrote {n_written} monthly partition(s) to {pred_out_dir}")
+    print(f"Predicted bad rate {round(pred_label.mean(), 3)} vs actual {round(df['label'].mean(), 3)}")
 
 
 if __name__ == "__main__":

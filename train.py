@@ -1,3 +1,16 @@
+"""Train the credit-default model on the gold label store.
+
+The split is time-based rather than random: the most recent months are held out
+as an out-of-time (OOT) set, because a credit model is judged on how it holds up
+on applications it has never seen, not on a random slice of the same period.
+
+Per-round training curves are streamed to TensorBoard (http://localhost:6006).
+
+Usage:
+    python train.py --snapshot 2024-12-01
+    python train.py --snapshot 2024-12-01 --tune false --max_depth 4
+"""
+
 import os
 import glob
 import argparse
@@ -7,7 +20,6 @@ from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 
 import pyspark
-import pyspark.sql.functions as F
 from pyspark.sql.functions import col
 
 import pandas as pd
@@ -93,53 +105,45 @@ def apply_target_encoding(X_cat, maps):
 
 
 def main(snapshot_date_arg, tune=True, hp=None):
-    print("\n=====================================================================")
-    print("      INITIATING PRODUCTION MODEL TRAINING PIPELINE ARCHITECTURE     ")
-    print("=====================================================================\n")
-
-    # 1. Initialize heavy local-optimized Spark Session
+    # Spark is used only to read and filter the gold partitions; the model
+    # itself trains in pandas/xgboost.
     spark = pyspark.sql.SparkSession.builder \
         .appName("Credit-Model-Training") \
         .master("local[*]") \
         .getOrCreate()
     spark.sparkContext.setLogLevel("ERROR")
 
-    # 2. Build configuration setup
     config = create_dynamic_config(model_train_date_str=snapshot_date_arg)
-    print("[SYSTEM INFO] Training configuration timeline anchors finalized:")
+    print("Training window:")
     pprint.pprint(config)
 
-    # 3. Connect and extract from Gold Label Store
     label_folder_path = "datamart/gold/label_store/"
     label_files = glob.glob(os.path.join(label_folder_path, '*.parquet'))
 
     if not label_files:
-        raise FileNotFoundError(f"[CRITICAL] No gold label parquet shards discovered at {label_folder_path}")
+        raise FileNotFoundError(f"No gold partitions found at {label_folder_path}. Run the data pipeline first.")
 
     label_store_sdf = spark.read.parquet(*label_files)
 
     
     label_store_sdf = label_store_sdf.dropDuplicates(["loan_id"])
-    print(f"[INFO] Gold rows after de-duplication (1 row/loan): {label_store_sdf.count()}")
+    print(f"Gold rows after de-duplication (1 per loan): {label_store_sdf.count()}")
 
     # Apply dynamic historical timeline filter constraints
     labels_sdf = label_store_sdf.filter(
         (col("snapshot_date") >= config["train_test_start_date"]) &
         (col("snapshot_date") <= config["oot_end_date"])
     )
-    print(f"\n[INFO] Extracted Gold Datasets snapshot records count: {labels_sdf.count()}")
+    print(f"Gold rows in window: {labels_sdf.count()}")
 
-    # 4. Migrate to Pandas
-    print("[INFO] Loading analytical storage framework into Pandas ecosystem...")
     data_pdf = labels_sdf.toPandas()
     spark.stop()
 
     if data_pdf.empty:
-        print("[WARNING] Compiled master dataframe is empty. Terminating process.")
+        print("No rows in the training window — nothing to train on.")
         return
 
-    # 5. Time-based cohorts (leakage-safe split)
-    print("[INFO] Stratifying datasets into specialized chronological cohorts...")
+    # Time-based split: OOT is the most recent months, train/dev the window before it.
     data_pdf['snapshot_date'] = pd.to_datetime(data_pdf['snapshot_date']).dt.date
 
     oot_start_d = config["oot_start_date"].date()
@@ -183,10 +187,10 @@ def main(snapshot_date_arg, tune=True, hp=None):
     Xoot_df = oot_pdf[carry_cols].copy()
     y_oot = oot_pdf["label"]
 
-    print(f"   -> Numeric features: {len(numeric_cols)} | Target-encoded: {len(te_cols)} | Total: {len(feature_cols)}")
-    print(f"   -> Train Size: {Xtt_df.shape[0]} | Bad Rate: {round(y_train.mean(), 3)}")
-    print(f"   -> Dev   Size: {Xdev_df.shape[0]} | Bad Rate: {round(y_test.mean(), 3)}")
-    print(f"   -> OOT   Size: {Xoot_df.shape[0]} | Bad Rate: {round(y_oot.mean(), 3)}\n")
+    print(f"\nFeatures: {len(numeric_cols)} numeric + {len(te_cols)} target-encoded = {len(feature_cols)}")
+    print(f"  train: {Xtt_df.shape[0]} rows, bad rate {round(y_train.mean(), 3)}")
+    print(f"  dev:   {Xdev_df.shape[0]} rows, bad rate {round(y_test.mean(), 3)}")
+    print(f"  oot:   {Xoot_df.shape[0]} rows, bad rate {round(y_oot.mean(), 3)}\n")
 
     # 6a. Impute numeric features:
     imputer = SimpleImputer(strategy="median")
@@ -206,7 +210,6 @@ def main(snapshot_date_arg, tune=True, hp=None):
     X_oot       = pd.concat([num_oot,   te_oot],   axis=1)[feature_cols]
 
     # 6d. Standard Scaler
-    print("[INFO] Fitting Standard Scaler preprocessing pipelines...")
     scaler = StandardScaler()
     transformer_stdscaler = scaler.fit(X_train_raw)
     X_train_processed = transformer_stdscaler.transform(X_train_raw)
@@ -217,11 +220,11 @@ def main(snapshot_date_arg, tune=True, hp=None):
     pos = int((y_train == 1).sum())
     neg = int((y_train == 0).sum())
     scale_pos_weight = (neg / pos) if pos > 0 else 1.0
-    print(f"[INFO] Class balance -> pos={pos}, neg={neg}, scale_pos_weight={round(scale_pos_weight,3)}")
+    print(f"Class balance: {pos} bad / {neg} good, scale_pos_weight={round(scale_pos_weight, 3)}")
 
     if tune:
         # ---- tune=True: search a grid with RandomizedSearchCV ----
-        print("[INFO] tune=True -> RandomizedSearchCV hyperparameter tuning...")
+        print("Running hyperparameter search (RandomizedSearchCV)...")
         xgb_clf = xgb.XGBClassifier(
             eval_metric='logloss', random_state=88, scale_pos_weight=scale_pos_weight
         )
@@ -240,7 +243,6 @@ def main(snapshot_date_arg, tune=True, hp=None):
             estimator=xgb_clf, param_distributions=param_dist, scoring='roc_auc',
             n_iter=100, cv=3, verbose=0, random_state=42, n_jobs=-1
         )
-        print(">>> Fitting CV candidate permutations...")
         random_search.fit(X_train_processed, y_train)
         best_params = random_search.best_params_
         # best_estimator_ is already refit on the full training set (clean to pickle)
@@ -256,13 +258,13 @@ def main(snapshot_date_arg, tune=True, hp=None):
             'subsample': float(hp.get('subsample', 0.8)),
             'colsample_bytree': float(hp.get('colsample_bytree', 0.8)),
         }
-        print(f"[INFO] tune=False -> training single model with fixed params: {best_params}")
+        print(f"Training with fixed parameters: {best_params}")
         best_model = xgb.XGBClassifier(
             **best_params, eval_metric='logloss', random_state=88, scale_pos_weight=scale_pos_weight
         )
         best_model.fit(X_train_processed, y_train)
 
-    print(f"[SUCCESS] Hyperparameters in use: {best_params}")
+    print(f"Hyperparameters in use: {best_params}")
 
     # ---- TensorBoard: train a SEPARATE instrumented copy ONLY to stream the
     # per-boosting-round curves. This copy is never persisted, so the saved
@@ -275,9 +277,9 @@ def main(snapshot_date_arg, tune=True, hp=None):
         from tensorboardX import SummaryWriter
         os.makedirs(tb_log_dir, exist_ok=True)
         writer = SummaryWriter(logdir=tb_log_dir)
-        print(f"[INFO] TensorBoard logs -> {tb_log_dir} (view at http://localhost:6006)")
+        print(f"TensorBoard logs: {tb_log_dir} (http://localhost:6006)")
     except Exception as e:
-        print(f"[WARN] TensorBoard logging disabled: {e}")
+        print(f"TensorBoard logging disabled: {e}")
 
     if writer:
         tb_callbacks = [TensorBoardCallback(writer, {"validation_0": "train", "validation_1": "dev"})]
@@ -294,15 +296,14 @@ def main(snapshot_date_arg, tune=True, hp=None):
             verbose=False,
         )
 
-    # 8. Validation metrics & Gini
     train_auc = roc_auc_score(y_train, best_model.predict_proba(X_train_processed)[:, 1])
     test_auc = roc_auc_score(y_test, best_model.predict_proba(X_test_processed)[:, 1])
     oot_auc = roc_auc_score(y_oot, best_model.predict_proba(X_oot_processed)[:, 1])
 
-    print("\n--- Model Validation Diagnostic Summary ---")
-    print(f"   -> Train AUC: {round(train_auc, 4)} | Gini: {round(2 * train_auc - 1, 3)}")
-    print(f"   -> Dev   AUC: {round(test_auc, 4)}  | Gini: {round(2 * test_auc - 1, 3)}")
-    print(f"   -> OOT   AUC: {round(oot_auc, 4)}  | Gini: {round(2 * oot_auc - 1, 3)}\n")
+    print("\nResults:")
+    print(f"  train AUC {round(train_auc, 4)} | Gini {round(2 * train_auc - 1, 3)}")
+    print(f"  dev   AUC {round(test_auc, 4)} | Gini {round(2 * test_auc - 1, 3)}")
+    print(f"  oot   AUC {round(oot_auc, 4)} | Gini {round(2 * oot_auc - 1, 3)}\n")
 
     # ---- TensorBoard: log final summary scalars + hyperparameters, then close ----
     if writer:
@@ -314,10 +315,11 @@ def main(snapshot_date_arg, tune=True, hp=None):
             hp_log = {k: (v if isinstance(v, (int, float, str, bool)) else str(v)) for k, v in best_params.items()}
             writer.add_hparams(hp_log, {"hparam/auc_dev": test_auc, "hparam/auc_oot": oot_auc})
         except Exception as e:
-            print(f"[WARN] add_hparams skipped: {e}")
+            print(f"add_hparams skipped: {e}")
         writer.close()
 
-    # 9. Serialize artefact (model_version already defined above for TensorBoard)
+    # Persist the model together with everything inference needs to reproduce
+    # the exact same transformations.
     model_artefact = {
         'model': best_model,
         'model_version': model_version,
@@ -342,7 +344,6 @@ def main(snapshot_date_arg, tune=True, hp=None):
         'hp_params': best_params
     }
 
-    # 10. Persist to model bank
     model_bank_dir = "model_bank/"
     if not os.path.exists(model_bank_dir):
         os.makedirs(model_bank_dir)
@@ -351,10 +352,7 @@ def main(snapshot_date_arg, tune=True, hp=None):
     with open(output_file_path, 'wb') as file:
         pickle.dump(model_artefact, file)
 
-    print(f"[SUCCESS] Core model artefact secured and exported to: {output_file_path}")
-    print("\n=====================================================================")
-    print("             PIPELINE SYSTEM SHUTDOWN COMPLETED CLEANLY              ")
-    print("=====================================================================\n")
+    print(f"Saved model artefact: {output_file_path}")
 
 
 def _str2bool(v):
@@ -363,7 +361,7 @@ def _str2bool(v):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Production Credit Scoring Model Training Platform")
+    parser = argparse.ArgumentParser(description="Train the credit-default model on the gold label store")
     parser.add_argument("--snapshot", type=str, required=True,
                         help="Training snapshot date YYYY-MM-DD (Train/Dev/OOT derived backwards from here)")
     # --- Hyperparameter controls (driven by Airflow params) ---
